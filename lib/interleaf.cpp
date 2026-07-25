@@ -15,12 +15,14 @@ static const uint32_t kMinimumChunkSize = 8;
 
 Interleaf::Interleaf()
 {
+  m_ObjectCount = 0;
 }
 
 void Interleaf::Clear()
 {
   m_Info.clear();
   m_BufferSize = 0;
+  m_ObjectCount = 0;
   m_JoiningProgress = 0;
   m_JoiningSize = 0;
   m_ObjectOffsetTable.clear();
@@ -114,6 +116,7 @@ Interleaf::Error Interleaf::ReadChunk(Core *parent, FileBase *f, Info *info)
   case RIFF::MxOf:
   {
     uint32_t offset_count = f->ReadU32();
+    m_ObjectCount = offset_count;
 
     desc << "Count: " << offset_count;
 
@@ -144,23 +147,29 @@ Interleaf::Error Interleaf::ReadChunk(Core *parent, FileBase *f, Info *info)
 
       list_count = f->ReadU32();
       if (list_count == LIST::Act_ || list_count == LIST::RAND) {
-        desc << "Extension: ";
-        if (list_count == LIST::RAND) {
-          uint32_t rand_upper = f->ReadU32();
-          uint64_t rand_val = uint64_t(rand_upper) << 32 | list_count;
-          f->seek(1, File::SeekCurrent);
-          desc << ((const char *) &rand_val);
-        } else if (list_count == LIST::Act_) {
-          desc << ((const char *) &list_count);
-        }
-        desc << std::endl;
+        // MxDSSelectAction extension: instead of a count, the list starts
+        // with a null-terminated selector string (e.g. "RANDOM_3") whose
+        // first four characters were just read, followed by the actual count
+        // and one null-terminated value string per child. Retain the raw
+        // bytes on the parent object so Write can reproduce them.
+        bytearray ext;
+        ext.append((const char *) &list_count, sizeof(list_count));
 
-        // Re-read list count
+        std::string selector = f->ReadString();
+        ext.append(selector.c_str(), selector.size() + 1);
+        desc << "Extension: " << RIFF::PrintU32AsString(list_count) << selector << std::endl;
+
         list_count = f->ReadU32();
+        ext.append((const char *) &list_count, sizeof(list_count));
+
         for (uint32_t i=0; i<list_count; i++) {
-          // Read every short
-          uint16_t val = f->ReadU16();
-          desc << "  " << ((const char *) &val) << std::endl;
+          std::string val = f->ReadString();
+          ext.append(val.c_str(), val.size() + 1);
+          desc << "  " << val << std::endl;
+        }
+
+        if (parent != static_cast<Core*>(this)) {
+          static_cast<Object*>(parent)->list_extension_ = ext;
         }
       }
       desc << "Count: " << list_count << std::endl;
@@ -435,7 +444,7 @@ Interleaf::Error Interleaf::Write(FileBase *f) const
     // MxOf
     RIFF::Chk mxof = RIFF::BeginChunk(f, RIFF::MxOf);
 
-    f->WriteU32(GetChildCount());
+    f->WriteU32(m_ObjectCount ? m_ObjectCount : uint32_t(GetChildCount()));
 
     offset_table_pos = f->pos();
 
@@ -458,7 +467,9 @@ Interleaf::Error Interleaf::Write(FileBase *f) const
         continue;
       }
 
-      size_t maxSz = child->CalculateMaximumDiskSize() + kMinimumChunkSize;
+      // MxSt header + object tree + the MxDa LIST header that follows it,
+      // all of which must not straddle a buffer boundary
+      size_t maxSz = child->CalculateMaximumDiskSize() + kMinimumChunkSize * 2 + 4;
       WritePaddingIfNecessary(f, maxSz);
 
       uint32_t mxst_offset = f->pos();
@@ -551,7 +562,11 @@ void Interleaf::WriteObject(FileBase *f, const Object *o) const
     RIFF::Chk list_mxch = RIFF::BeginChunk(f, RIFF::LIST);
 
     f->WriteU32(RIFF::MxCh);
-    f->WriteU32(o->GetChildCount());
+    if (o->list_extension_.empty()) {
+      f->WriteU32(o->GetChildCount());
+    } else {
+      f->WriteBytes(o->list_extension_);
+    }
 
     for (size_t i = 0; i < o->GetChildCount(); i++) {
       WriteObject(f, static_cast<Object*>(o->GetChildAt(i)));
@@ -805,7 +820,16 @@ void Interleaf::WritePaddingIfNecessary(FileBase *f, size_t projectedWrite) cons
   size_t this_buf = f->pos()/m_BufferSize;
   size_t end_buf = projected_end/m_BufferSize;
   if (this_buf != end_buf) {
-    WritePadding(f, (end_buf * m_BufferSize) - f->pos());
+    size_t pad = (end_buf * m_BufferSize) - f->pos();
+    if (pad < kMinimumChunkSize) {
+      // Too small for a pad_ chunk; fill with zeroes, which readers skip as
+      // part of the buffer alignment rule
+      bytearray b(pad);
+      b.fill(0);
+      f->WriteBytes(b);
+    } else {
+      WritePadding(f, pad);
+    }
   }
 }
 
